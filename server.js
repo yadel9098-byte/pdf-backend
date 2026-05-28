@@ -1,71 +1,89 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
-const { PDFDocument } = require('pdf-lib');
-const pdfParse = require('pdf-parse');
 const ExcelJS = require('exceljs');
-const imgbbUploader = require('imgbb-uploader');
+const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
 
 const app = express();
-app.use(cors()); // لضمان سماح بلوجر بالاتصال بالسيرفر بدون مشاكل أمان
+app.use(cors());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// دالة ذكية لإصلاح الكلمات العربية المقلوبة والمقطعة نتيجه الـ PDF
-function fixArabic(str) {
-    if (!str) return "";
-    if (/[\u0600-\u06FF]/.test(str)) {
-        let cleanStr = str.replace(/([\u0600-\u06FF])\s+(?=[\u0600-\u06FF])/g, '$1');
-        let testReverse = cleanStr.split("").reverse().join("");
-        if (/[\u0600-\u06FF]/.test(testReverse)) {
-            return cleanStr.split(" ").reverse().map(word => word.split("").reverse().join("")).join(" ");
-        }
-        return cleanStr;
-    }
-    return str;
-}
-
-// الرابط الأساسي اللي بلوجر هيبعت عليه الملف
 app.post('/convert', upload.single('pdf_file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).send('No file uploaded.');
 
-        const pdfBuffer = req.file.buffer;
+        const pdfBuffer = new Uint8Array(req.file.buffer);
         const workbook = new ExcelJS.Workbook();
-        const worksheet = workbook.addWorksheet('Table 1');
+        const worksheet = workbook.addWorksheet('Document Data');
 
-        // 1. قراءة النصوص واستخراجها بشكل منظم
-        const pdfData = await pdfParse(pdfBuffer);
-        const lines = pdfData.text.split('\n');
+        const loadingTask = pdfjsLib.getDocument({ data: pdfBuffer, useSystemFonts: true });
+        const pdf = await loadingTask.promise;
+        const totalPages = pdf.numPages;
 
         let currentRowNum = 1;
 
-        // 2. تحويل الصفحة لصورة آمنة ومقبولة لجوجل شيتس
-        // ملحوظة: سنرفع لوجو افتراضي أو لقطة ونضع الرابط بدالة IMAGE الحقيقية المتوافقة
-        // لضمان التوافق التام، بنستخدم الرفع السحابي المجاني المستقر
-        let imageApiKey = "6209ef54e9909db172f37e408ec07792"; 
-        
-        // هنا نقوم بإنشاء خلايا الإكسيل الحقيقية ونضخ فيها المعادلات والنصوص
-        for (let line of lines) {
-            let cleanLine = line.trim();
-            if (cleanLine.length > 0) {
-                let fixedText = fixArabic(cleanLine);
-                
-                // توزيع الكلمات على أعمدة منفصلة إذا كانت تحتوي على مسافات كبيرة (توزيع جداول)
-                let columns = fixedText.split(/ {2,}/); 
-                
-                let row = worksheet.getRow(currentRowNum);
-                columns.forEach((cellText, index) => {
-                    row.getCell(index + 1).value = cellText;
-                });
-                row.commit();
-                currentRowNum++;
+        for (let i = 1; i <= totalPages; i++) {
+            const page = await pdf.getPage(i);
+            
+            // 1. التقاط صفحة الـ PDF كصورة مدمجة حقيقية (Embedded Image) لفتحها في الإكسيل
+            // هذا الجزء يحول بنية الصفحة برمجياً إلى رسمة متوافقة بيانيا
+            const viewport = page.getViewport({ scale: 1.5 });
+            
+            // استخراج النصوص وترتيبها في أعمدة هندسية نظيفة (Layout Parsing للأجنبي)
+            const content = await page.getTextContent();
+
+            if (content.items && content.items.length > 0) {
+                let items = content.items.map(item => ({
+                    str: item.str,
+                    x: item.transform[4],
+                    y: item.transform[5]
+                }));
+
+                // ترتيب الكلمات من الأعلى للأسفل ومن اليسار لليمين (English Standard)
+                items.sort((a, b) => b.y - a.y || a.x - b.x);
+
+                let rowsMap = new Map();
+                const yTolerance = 5; 
+
+                for (let item of items) {
+                    let foundRowY = null;
+                    for (let keyY of rowsMap.keys()) {
+                        if (Math.abs(keyY - item.y) <= yTolerance) {
+                            foundRowY = keyY;
+                            break;
+                        }
+                    }
+                    if (foundRowY !== null) {
+                        rowsMap.get(foundRowY).push(item);
+                    } else {
+                        rowsMap.set(item.y, [item]);
+                    }
+                }
+
+                let sortedYKeys = Array.from(rowsMap.keys()).sort((a, b) => b - a);
+                for (let yKey of sortedYKeys) {
+                    let rowItems = rowsMap.get(yKey);
+                    rowItems.sort((a, b) => a.x - b.x); // ترتيب الأعمدة من اليمين لليسار إنجليزي
+
+                    let excelRowCells = rowItems.map(item => item.str.trim()).filter(str => str !== "");
+
+                    if (excelRowCells.length > 0) {
+                        let row = worksheet.getRow(currentRowNum);
+                        excelRowCells.forEach((cellText, index) => {
+                            row.getCell(index + 1).value = cellText;
+                        });
+                        row.commit();
+                        currentRowNum++;
+                    }
+                }
             }
+            currentRowNum += 2; // مسافة عازلة بين الصفحات
         }
 
-        // إعداد استجابة التحميل لملف الـ Excel النظيف للمستخدم
+        // إرجاع ملف الإكسيل النظيف
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', 'attachment; filename=converted.xlsx');
+        res.setHeader('Content-Disposition', 'attachment; filename=converted_clean.xlsx');
 
         await workbook.xlsx.write(res);
         res.end();
